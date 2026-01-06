@@ -10,454 +10,290 @@ using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Windowing;
 using Silk.NET.Windowing.Glfw;
-using Triangle;
 using Device = Silk.NET.Vulkan.Device;
 using Semaphore = Silk.NET.Vulkan.Semaphore;
 
-unsafe
+namespace Triangle;
+
+internal static unsafe class Program
 {
-    GlfwWindowing.RegisterPlatform();
-    GlfwInput.RegisterPlatform();
-
-    IWindow window = Window.Create(WindowOptions.DefaultVulkan);
-    window.Initialize();
-    ArgumentNullException.ThrowIfNull(window.VkSurface);
-
-    bool enableValidationLayers = false;
-
-    string[] validationLayers = ["VK_LAYER_KHRONOS_validation"];
-    string[] physicalDeviceExtensions = [KhrSwapchain.ExtensionName];
-
-    Vk vk = Vk.GetApi();
-
-    if (enableValidationLayers)
+    private struct VkQueueFamilyIndices
     {
-        Trace.Assert(CheckValidationLayersSupport());
+        public uint? GraphicsFamilyIndex { get; set; }
+        public uint? PresentFamilyIndex { get; set; }
+
+        public readonly bool IsComplete =>
+            GraphicsFamilyIndex.HasValue && PresentFamilyIndex.HasValue;
     }
 
-    #region Create Instance
-
-    string[] extensions = GetRequiredExtensions();
-
-    ApplicationInfo applicationInfo = new()
+    private struct VkSwapchainSupportDetails
     {
-        SType = StructureType.ApplicationInfo,
-        PApplicationName = (byte*)Marshal.StringToHGlobalAnsi("Triangle"),
-        PEngineName = (byte*)Marshal.StringToHGlobalAnsi("Silk.NET"),
-        ApplicationVersion = new Version32(1, 0, 0),
-        EngineVersion = new Version32(1, 0, 0),
-        ApiVersion = Vk.Version13,
-    };
+        public SurfaceCapabilitiesKHR SurfaceCapabilities { get; set; }
+        public SurfaceFormatKHR[] SurfaceFormats { get; set; } = [];
+        public PresentModeKHR[] PresentModes { get; set; } = [];
 
-    InstanceCreateInfo instanceCreateInfo = new()
-    {
-        SType = StructureType.InstanceCreateInfo,
-        PApplicationInfo = &applicationInfo,
-        EnabledExtensionCount = (uint)extensions.Length,
-        PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(extensions),
-    };
+        public VkSwapchainSupportDetails() { }
+    }
 
-    DebugUtilsMessengerCreateInfoEXT debugMessengerCreateInfo = new()
+    private const int VK_MAX_FRAMES_IN_FLIGHT = 2;
+
+    private static readonly bool s_vkEnableValidationLayers = false;
+
+    private static readonly string[] s_vkRequiredValidationLayers = ["VK_LAYER_KHRONOS_validation"];
+    private static readonly string[] s_vkRequiredPhysicalDeviceExtensions =
+    [
+        KhrSwapchain.ExtensionName,
+    ];
+
+    private static IWindow s_window = null!;
+
+    private static Vk s_vkApi = null!;
+
+    private static Instance s_vkInstance;
+
+    private static ExtDebugUtils s_vkExtDebugUtils = null!;
+    private static DebugUtilsMessengerEXT s_vkDebugMessenger;
+    private static DebugUtilsMessengerCreateInfoEXT s_vkDebugMessengerCreateInfo;
+
+    private static KhrSurface s_vkKhrSurface = null!;
+    private static SurfaceKHR s_vkSurface;
+
+    private static PhysicalDevice s_vkPhysicalDevice;
+    private static VkQueueFamilyIndices s_vkQueueFamilyIndices;
+
+    private static Device s_vkDevice;
+    private static Queue s_vkGraphicsQueue;
+    private static Queue s_vkPresentQueue;
+
+    private static KhrSwapchain s_vkKhrSwapchain = null!;
+    private static SwapchainKHR s_vkSwapchain;
+    private static Format s_vkSwapchainImageFormat;
+    private static Extent2D s_vkSwapchainExtent;
+    private static Image[] s_vkSwapchainImages = null!;
+
+    private static ImageView[] s_vkSwapchainImageViews = null!;
+
+    private static RenderPass s_vkRenderPass;
+    private static Pipeline s_vkGraphicsPipeline;
+    private static PipelineLayout s_vkPipelineLayout;
+
+    private static Framebuffer[] s_vkSwapchainFramebuffers = null!;
+
+    private static CommandPool s_vkCommandPool;
+    private static CommandBuffer[] s_vkCommandBuffers = null!;
+
+    private static Semaphore[] s_vkImageAvailableSemaphores = null!;
+    private static Semaphore[] s_vkRenderFinishedSemaphores = null!;
+    private static Fence[] s_vkInFlightFences = null!;
+    private static Fence[] s_vkImagesInFlight = null!;
+
+    private static int s_vkCurrentFrame;
+
+    private static void Main()
     {
-        SType = StructureType.DebugUtilsMessengerCreateInfoExt,
-        MessageSeverity =
+        Init();
+        Run();
+        Cleanup();
+    }
+
+    private static void Init()
+    {
+        RegisterGlfw();
+        InitWindow();
+        InitVulkan();
+    }
+
+    private static void Run()
+    {
+        s_window.Render += DrawFrame;
+        s_window.Run();
+        Trace.Assert(s_vkApi.DeviceWaitIdle(s_vkDevice) == Result.Success);
+    }
+
+    private static void Cleanup()
+    {
+        for (int i = 0; i < VK_MAX_FRAMES_IN_FLIGHT; i++)
+        {
+            s_vkApi.DestroySemaphore(s_vkDevice, s_vkRenderFinishedSemaphores[i], null);
+            s_vkApi.DestroySemaphore(s_vkDevice, s_vkImageAvailableSemaphores[i], null);
+            s_vkApi.DestroyFence(s_vkDevice, s_vkInFlightFences[i], null);
+        }
+
+        s_vkApi.DestroyCommandPool(s_vkDevice, s_vkCommandPool, null);
+
+        foreach (Framebuffer framebuffer in s_vkSwapchainFramebuffers)
+        {
+            s_vkApi.DestroyFramebuffer(s_vkDevice, framebuffer, null);
+        }
+
+        s_vkApi.DestroyPipeline(s_vkDevice, s_vkGraphicsPipeline, null);
+        s_vkApi.DestroyPipelineLayout(s_vkDevice, s_vkPipelineLayout, null);
+        s_vkApi.DestroyRenderPass(s_vkDevice, s_vkRenderPass, null);
+
+        foreach (ImageView imageView in s_vkSwapchainImageViews)
+        {
+            s_vkApi.DestroyImageView(s_vkDevice, imageView, null);
+        }
+
+        s_vkKhrSwapchain.DestroySwapchain(s_vkDevice, s_vkSwapchain, null);
+
+        s_vkApi.DestroyDevice(s_vkDevice, null);
+
+        if (s_vkEnableValidationLayers)
+        {
+            s_vkExtDebugUtils.DestroyDebugUtilsMessenger(s_vkInstance, s_vkDebugMessenger, null);
+        }
+
+        s_vkKhrSurface.DestroySurface(s_vkInstance, s_vkSurface, null);
+        s_vkApi.DestroyInstance(s_vkInstance, null);
+        s_vkApi.Dispose();
+
+        s_window.Dispose();
+    }
+
+    private static void RegisterGlfw()
+    {
+        GlfwWindowing.RegisterPlatform();
+        GlfwInput.RegisterPlatform();
+    }
+
+    private static void InitWindow()
+    {
+        s_window = Window.Create(WindowOptions.DefaultVulkan);
+        s_window.Initialize();
+        ArgumentNullException.ThrowIfNull(s_window.VkSurface);
+    }
+
+    private static void InitVulkan()
+    {
+        VkInitApi();
+        VkPopulateDebugMessengerCreateInfo();
+        VkCreateInstance();
+        VkCreateDebugMessenger();
+        VkCreateSurface();
+        VkFindPhysicalDevice();
+        VkCreateLogicalDevice();
+        VkCreateSwapchain();
+        VkCreateSwapchainImageViews();
+        VkCreateRenderPass();
+        VkCreateGraphicsPipeline();
+        VkCreateSwapchainFramebuffers();
+        VkCreateCommandPool();
+        VkCreateCommandBuffers();
+        VkCreateSynchronizationObjects();
+    }
+
+    private static void VkInitApi()
+    {
+        s_vkApi = Vk.GetApi();
+
+        if (s_vkEnableValidationLayers)
+        {
+            Trace.Assert(VkCheckValidationLayersSupport());
+        }
+    }
+
+    private static void VkPopulateDebugMessengerCreateInfo()
+    {
+        s_vkDebugMessengerCreateInfo.SType = StructureType.DebugUtilsMessengerCreateInfoExt;
+        s_vkDebugMessengerCreateInfo.MessageSeverity =
             DebugUtilsMessageSeverityFlagsEXT.VerboseBitExt
             | DebugUtilsMessageSeverityFlagsEXT.WarningBitExt
-            | DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt,
-        MessageType =
+            | DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt;
+        s_vkDebugMessengerCreateInfo.MessageType =
             DebugUtilsMessageTypeFlagsEXT.GeneralBitExt
             | DebugUtilsMessageTypeFlagsEXT.PerformanceBitExt
-            | DebugUtilsMessageTypeFlagsEXT.ValidationBitExt,
-        PfnUserCallback = (DebugUtilsMessengerCallbackFunctionEXT)DebugCallback,
-    };
-
-    if (enableValidationLayers)
-    {
-        instanceCreateInfo.EnabledLayerCount = (uint)validationLayers.Length;
-        instanceCreateInfo.PpEnabledLayerNames = (byte**)
-            SilkMarshal.StringArrayToPtr(validationLayers);
-        instanceCreateInfo.PNext = &debugMessengerCreateInfo;
+            | DebugUtilsMessageTypeFlagsEXT.ValidationBitExt;
+        s_vkDebugMessengerCreateInfo.PfnUserCallback =
+            (DebugUtilsMessengerCallbackFunctionEXT)VkDebugCallback;
     }
 
-    Trace.Assert(
-        vk.CreateInstance(in instanceCreateInfo, null, out Instance instance) == Result.Success
-    );
-
-    Marshal.FreeHGlobal((nint)applicationInfo.PApplicationName);
-    Marshal.FreeHGlobal((nint)applicationInfo.PEngineName);
-
-    Trace.Assert(SilkMarshal.Free((nint)instanceCreateInfo.PpEnabledExtensionNames));
-    if (enableValidationLayers)
+    private static void VkCreateInstance()
     {
-        Trace.Assert(SilkMarshal.Free((nint)instanceCreateInfo.PpEnabledLayerNames));
-    }
+        string[] enabledExtensions = VkGetInstanceRequiredExtensions();
 
-    #endregion
+        ApplicationInfo applicationInfo = new()
+        {
+            SType = StructureType.ApplicationInfo,
+            PApplicationName = (byte*)Marshal.StringToHGlobalAnsi("Triangle"),
+            PEngineName = (byte*)Marshal.StringToHGlobalAnsi("Silk.NET"),
+            ApplicationVersion = new Version32(1, 0, 0),
+            EngineVersion = new Version32(1, 0, 0),
+            ApiVersion = Vk.Version13,
+        };
 
-    #region Create Debug Messenger
+        InstanceCreateInfo instanceCreateInfo = new()
+        {
+            SType = StructureType.InstanceCreateInfo,
+            PApplicationInfo = &applicationInfo,
+            EnabledExtensionCount = (uint)enabledExtensions.Length,
+            PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(enabledExtensions),
+        };
 
-    ExtDebugUtils extDebugUtils = null!;
-    DebugUtilsMessengerEXT debugMessenger = new();
+        DebugUtilsMessengerCreateInfoEXT debugMessengerCreateInfo = s_vkDebugMessengerCreateInfo;
 
-    if (enableValidationLayers)
-    {
-        Trace.Assert(vk.TryGetInstanceExtension(instance, out extDebugUtils));
+        if (s_vkEnableValidationLayers)
+        {
+            instanceCreateInfo.EnabledLayerCount = (uint)s_vkRequiredValidationLayers.Length;
+            instanceCreateInfo.PpEnabledLayerNames = (byte**)
+                SilkMarshal.StringArrayToPtr(s_vkRequiredValidationLayers);
+            instanceCreateInfo.PNext = &debugMessengerCreateInfo;
+        }
+
         Trace.Assert(
-            extDebugUtils.CreateDebugUtilsMessenger(
-                instance,
-                in debugMessengerCreateInfo,
-                null,
-                out debugMessenger
-            ) == Result.Success
-        );
-    }
-
-    #endregion
-
-    #region Create Surface
-
-    Trace.Assert(vk.TryGetInstanceExtension(instance, out KhrSurface khrSurface));
-
-    SurfaceKHR surface = window
-        .VkSurface.Create<AllocationCallbacks>(instance.ToHandle(), null)
-        .ToSurface();
-
-    #endregion
-
-    #region Get Physical Device
-
-    PhysicalDevice physicalDevice = vk.GetPhysicalDevices(instance).First(IsSuitable);
-
-    #endregion
-
-    #region Create Logical Device
-
-    Device device = CreateLogicalDevice(out Queue graphicsQueue, out Queue presentQueue);
-
-    #endregion
-
-    #region Create Swapchain
-
-    Trace.Assert(vk.TryGetDeviceExtension(instance, device, out KhrSwapchain khrSwapchain));
-
-    SwapchainKHR swapchain = CreateSwapchain(
-        out Image[] swapchainImages,
-        out Format swapchainImageFormat,
-        out Extent2D swapchainExtent
-    );
-
-    ImageView[] swapchainImageViews = CreateSwapchainImageViews();
-
-    #endregion
-
-    #region Create Graphics Pipeline
-
-    RenderPass renderPass = CreateRenderPass();
-    Pipeline graphicsPipeline = CreateGraphicsPipeline(out PipelineLayout pipelineLayout);
-
-    #endregion
-
-    #region Create Swapchain Framebuffers
-
-    Framebuffer[] swapchainFramebuffers = CreateSwapchainFramebuffers();
-
-    #endregion
-
-    #region Create Command Buffers
-
-    CommandPool commandPool = CreateCommandPool();
-    CommandBuffer[] commandBuffers = CreateCommandBuffers();
-
-    #endregion
-
-    #region Create Synchronization Objects
-
-    int maxFramesInFlight = 2;
-
-    CreateSynchronizationObjects(
-        out Semaphore[] imageAvailableSemaphores,
-        out Semaphore[] renderFinishedSemaphores,
-        out Fence[] inFlightFences,
-        out Fence[] imagesInFlight
-    );
-
-    int currentFrame = 0;
-
-    #endregion
-
-    #region Main Loop
-
-    window.Render += DrawFrame;
-    window.Run();
-    Trace.Assert(vk.DeviceWaitIdle(device) == Result.Success);
-
-    #endregion
-
-    #region Clean Up
-
-    for (int i = 0; i < maxFramesInFlight; i++)
-    {
-        vk.DestroySemaphore(device, renderFinishedSemaphores[i], null);
-        vk.DestroySemaphore(device, imageAvailableSemaphores[i], null);
-        vk.DestroyFence(device, inFlightFences[i], null);
-    }
-
-    vk.DestroyCommandPool(device, commandPool, null);
-
-    foreach (Framebuffer framebuffer in swapchainFramebuffers)
-    {
-        vk.DestroyFramebuffer(device, framebuffer, null);
-    }
-
-    vk.DestroyPipeline(device, graphicsPipeline, null);
-    vk.DestroyPipelineLayout(device, pipelineLayout, null);
-    vk.DestroyRenderPass(device, renderPass, null);
-
-    foreach (ImageView imageView in swapchainImageViews)
-    {
-        vk.DestroyImageView(device, imageView, null);
-    }
-
-    khrSwapchain.DestroySwapchain(device, swapchain, null);
-
-    vk.DestroyDevice(device, null);
-
-    if (enableValidationLayers)
-    {
-        extDebugUtils.DestroyDebugUtilsMessenger(instance, debugMessenger, null);
-    }
-
-    khrSurface.DestroySurface(instance, surface, null);
-    vk.DestroyInstance(instance, null);
-    vk.Dispose();
-
-    window.Dispose();
-
-    #endregion
-
-    bool CheckValidationLayersSupport()
-    {
-        uint availableLayersCount = 0;
-        Trace.Assert(
-            vk.EnumerateInstanceLayerProperties(ref availableLayersCount, null) == Result.Success
+            s_vkApi.CreateInstance(in instanceCreateInfo, null, out s_vkInstance) == Result.Success
         );
 
-        LayerProperties[] availableLayers = new LayerProperties[availableLayersCount];
-        fixed (LayerProperties* availableLayersPtr = availableLayers)
+        Marshal.FreeHGlobal((nint)applicationInfo.PApplicationName);
+        Marshal.FreeHGlobal((nint)applicationInfo.PEngineName);
+
+        Trace.Assert(SilkMarshal.Free((nint)instanceCreateInfo.PpEnabledExtensionNames));
+        if (s_vkEnableValidationLayers)
         {
+            Trace.Assert(SilkMarshal.Free((nint)instanceCreateInfo.PpEnabledLayerNames));
+        }
+    }
+
+    private static void VkCreateDebugMessenger()
+    {
+        DebugUtilsMessengerCreateInfoEXT debugMessengerCreateInfo = s_vkDebugMessengerCreateInfo;
+
+        if (s_vkEnableValidationLayers)
+        {
+            Trace.Assert(s_vkApi.TryGetInstanceExtension(s_vkInstance, out s_vkExtDebugUtils));
             Trace.Assert(
-                vk.EnumerateInstanceLayerProperties(ref availableLayersCount, availableLayersPtr)
-                    == Result.Success
-            );
-        }
-
-        return validationLayers.All(
-            availableLayers.Select(x => Marshal.PtrToStringAnsi((nint)x.LayerName)).Contains
-        );
-    }
-
-    string[] GetRequiredExtensions()
-    {
-        byte** glfwExtensions = window.VkSurface.GetRequiredExtensions(out uint glfwExtensionCount);
-
-        string[] extensions = SilkMarshal.PtrToStringArray(
-            (nint)glfwExtensions,
-            (int)glfwExtensionCount
-        );
-
-        return enableValidationLayers ? [.. extensions, ExtDebugUtils.ExtensionName] : extensions;
-    }
-
-    uint DebugCallback(
-        DebugUtilsMessageSeverityFlagsEXT messageSeverity,
-        DebugUtilsMessageTypeFlagsEXT messageTypes,
-        DebugUtilsMessengerCallbackDataEXT* pCallbackData,
-        void* pUserData
-    )
-    {
-        Console.WriteLine(
-            $"VALIDATION LAYER: {Marshal.PtrToStringAnsi((nint)pCallbackData->PMessage)}"
-        );
-
-        return Vk.False;
-    }
-
-    bool IsSuitable(PhysicalDevice physicalDevice)
-    {
-        if (!FindQueueFamilies(physicalDevice).IsComplete)
-        {
-            return false;
-        }
-
-        if (!CheckExtensionsSupport(physicalDevice))
-        {
-            return false;
-        }
-
-        SwapchainSupportDetails swapchainSupportDetails = QuerySwapchainSupport(physicalDevice);
-
-        bool isSwapchainAdequate =
-            swapchainSupportDetails.Formats.Length != 0
-            && swapchainSupportDetails.PresentModes.Length != 0;
-
-        return isSwapchainAdequate;
-    }
-
-    QueueFamilyIndices FindQueueFamilies(PhysicalDevice physicalDevice)
-    {
-        uint queueFamiliesCount = 0;
-        vk.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, ref queueFamiliesCount, null);
-
-        QueueFamilyProperties[] queueFamilies = new QueueFamilyProperties[queueFamiliesCount];
-        fixed (QueueFamilyProperties* queueFamiliesPtr = queueFamilies)
-        {
-            vk.GetPhysicalDeviceQueueFamilyProperties(
-                physicalDevice,
-                ref queueFamiliesCount,
-                queueFamiliesPtr
-            );
-        }
-
-        QueueFamilyIndices queueFamilyIndices = new();
-
-        for (uint i = 0; i < queueFamilies.Length; i++)
-        {
-            if (queueFamilies[i].QueueFlags.HasFlag(QueueFlags.GraphicsBit))
-            {
-                queueFamilyIndices.GraphicsFamilyIndex ??= i;
-            }
-
-            Trace.Assert(
-                khrSurface.GetPhysicalDeviceSurfaceSupport(
-                    physicalDevice,
-                    i,
-                    surface,
-                    out Bool32 presentSupport
-                ) == Result.Success
-            );
-
-            if (presentSupport)
-            {
-                queueFamilyIndices.PresentFamilyIndex ??= i;
-            }
-
-            if (queueFamilyIndices.IsComplete)
-            {
-                break;
-            }
-        }
-
-        return queueFamilyIndices;
-    }
-
-    bool CheckExtensionsSupport(PhysicalDevice physicalDevice)
-    {
-        uint availableExtensionsCount = 0;
-        Trace.Assert(
-            vk.EnumerateDeviceExtensionProperties(
-                physicalDevice,
-                (byte*)null,
-                ref availableExtensionsCount,
-                null
-            ) == Result.Success
-        );
-
-        ExtensionProperties[] availableExtensions = new ExtensionProperties[
-            availableExtensionsCount
-        ];
-        fixed (ExtensionProperties* availableExtensionsPtr = availableExtensions)
-        {
-            Trace.Assert(
-                vk.EnumerateDeviceExtensionProperties(
-                    physicalDevice,
-                    (byte*)null,
-                    ref availableExtensionsCount,
-                    availableExtensionsPtr
+                s_vkExtDebugUtils.CreateDebugUtilsMessenger(
+                    s_vkInstance,
+                    in debugMessengerCreateInfo,
+                    null,
+                    out s_vkDebugMessenger
                 ) == Result.Success
             );
         }
-
-        return physicalDeviceExtensions.All(
-            availableExtensions.Select(x => Marshal.PtrToStringAnsi((nint)x.ExtensionName)).Contains
-        );
     }
 
-    SwapchainSupportDetails QuerySwapchainSupport(PhysicalDevice physicalDevice)
+    private static void VkCreateSurface()
     {
-        SwapchainSupportDetails swapchainSupportDetails = new();
+        Trace.Assert(s_vkApi.TryGetInstanceExtension(s_vkInstance, out s_vkKhrSurface));
 
-        Trace.Assert(
-            khrSurface.GetPhysicalDeviceSurfaceCapabilities(
-                physicalDevice,
-                surface,
-                out SurfaceCapabilitiesKHR capabilities
-            ) == Result.Success
-        );
-        swapchainSupportDetails.Capabilities = capabilities;
-
-        uint surfaceFormatsCount = 0;
-        Trace.Assert(
-            khrSurface.GetPhysicalDeviceSurfaceFormats(
-                physicalDevice,
-                surface,
-                ref surfaceFormatsCount,
-                null
-            ) == Result.Success
-        );
-
-        if (surfaceFormatsCount != 0)
-        {
-            swapchainSupportDetails.Formats = new SurfaceFormatKHR[surfaceFormatsCount];
-            fixed (SurfaceFormatKHR* surfaceFormatsPtr = swapchainSupportDetails.Formats)
-            {
-                Trace.Assert(
-                    khrSurface.GetPhysicalDeviceSurfaceFormats(
-                        physicalDevice,
-                        surface,
-                        ref surfaceFormatsCount,
-                        surfaceFormatsPtr
-                    ) == Result.Success
-                );
-            }
-        }
-
-        uint surfacePresentModesCount = 0;
-        Trace.Assert(
-            khrSurface.GetPhysicalDeviceSurfacePresentModes(
-                physicalDevice,
-                surface,
-                ref surfacePresentModesCount,
-                null
-            ) == Result.Success
-        );
-
-        if (surfacePresentModesCount != 0)
-        {
-            swapchainSupportDetails.PresentModes = new PresentModeKHR[surfacePresentModesCount];
-            fixed (PresentModeKHR* surfacePresentModesPtr = swapchainSupportDetails.PresentModes)
-            {
-                Trace.Assert(
-                    khrSurface.GetPhysicalDeviceSurfacePresentModes(
-                        physicalDevice,
-                        surface,
-                        ref surfacePresentModesCount,
-                        surfacePresentModesPtr
-                    ) == Result.Success
-                );
-            }
-        }
-
-        return swapchainSupportDetails;
+        s_vkSurface = s_window
+            .VkSurface!.Create<AllocationCallbacks>(s_vkInstance.ToHandle(), null)
+            .ToSurface();
     }
 
-    Device CreateLogicalDevice(out Queue graphicsQueue, out Queue presentQueue)
+    private static void VkFindPhysicalDevice()
     {
-        QueueFamilyIndices queueFamilyIndices = FindQueueFamilies(physicalDevice);
+        s_vkPhysicalDevice = s_vkApi
+            .GetPhysicalDevices(s_vkInstance)
+            .First(VkIsPhysicalDeviceSuitable);
+    }
 
+    private static void VkCreateLogicalDevice()
+    {
         uint[] uniqueQueueFamilies =
         [
-            queueFamilyIndices.GraphicsFamilyIndex!.Value,
-            queueFamilyIndices.PresentFamilyIndex!.Value,
+            s_vkQueueFamilyIndices.GraphicsFamilyIndex!.Value,
+            s_vkQueueFamilyIndices.PresentFamilyIndex!.Value,
         ];
         uniqueQueueFamilies = [.. uniqueQueueFamilies.Distinct()];
 
@@ -486,97 +322,94 @@ unsafe
             QueueCreateInfoCount = (uint)uniqueQueueFamilies.Length,
             PQueueCreateInfos = deviceQueueCreateInfos,
             PEnabledFeatures = &physicalDeviceFeatures,
-            EnabledExtensionCount = (uint)physicalDeviceExtensions.Length,
+            EnabledExtensionCount = (uint)s_vkRequiredPhysicalDeviceExtensions.Length,
             PpEnabledExtensionNames = (byte**)
-                SilkMarshal.StringArrayToPtr(physicalDeviceExtensions),
+                SilkMarshal.StringArrayToPtr(s_vkRequiredPhysicalDeviceExtensions),
         };
 
-        if (enableValidationLayers)
+        if (s_vkEnableValidationLayers)
         {
-            deviceCreateInfo.EnabledLayerCount = (uint)validationLayers.Length;
+            deviceCreateInfo.EnabledLayerCount = (uint)s_vkRequiredValidationLayers.Length;
             deviceCreateInfo.PpEnabledLayerNames = (byte**)
-                SilkMarshal.StringArrayToPtr(validationLayers);
+                SilkMarshal.StringArrayToPtr(s_vkRequiredValidationLayers);
         }
 
         Trace.Assert(
-            vk.CreateDevice(physicalDevice, in deviceCreateInfo, null, out Device device)
+            s_vkApi.CreateDevice(s_vkPhysicalDevice, in deviceCreateInfo, null, out s_vkDevice)
                 == Result.Success
         );
 
-        if (enableValidationLayers)
+        if (s_vkEnableValidationLayers)
         {
             Trace.Assert(SilkMarshal.Free((nint)deviceCreateInfo.PpEnabledLayerNames));
         }
 
         Trace.Assert(SilkMarshal.Free((nint)deviceCreateInfo.PpEnabledExtensionNames));
 
-        vk.GetDeviceQueue(
-            device,
-            queueFamilyIndices.GraphicsFamilyIndex!.Value,
+        s_vkApi.GetDeviceQueue(
+            s_vkDevice,
+            s_vkQueueFamilyIndices.GraphicsFamilyIndex!.Value,
             0,
-            out graphicsQueue
+            out s_vkGraphicsQueue
         );
-        vk.GetDeviceQueue(
-            device,
-            queueFamilyIndices.PresentFamilyIndex!.Value,
+        s_vkApi.GetDeviceQueue(
+            s_vkDevice,
+            s_vkQueueFamilyIndices.PresentFamilyIndex!.Value,
             0,
-            out presentQueue
+            out s_vkPresentQueue
         );
-
-        return device;
     }
 
-    SwapchainKHR CreateSwapchain(
-        out Image[] swapchainImages,
-        out Format swapchainImageFormat,
-        out Extent2D swapchainExtent
-    )
+    private static void VkCreateSwapchain()
     {
-        SwapchainSupportDetails swapchainSupportDetails = QuerySwapchainSupport(physicalDevice);
+        Trace.Assert(s_vkApi.TryGetDeviceExtension(s_vkInstance, s_vkDevice, out s_vkKhrSwapchain));
 
-        SurfaceFormatKHR surfaceFormat = ChooseSwapchainSurfaceFormat(
-            swapchainSupportDetails.Formats
+        VkSwapchainSupportDetails swapchainSupportDetails = VkQuerySwapchainSupport(
+            s_vkPhysicalDevice
         );
-        swapchainImageFormat = surfaceFormat.Format;
 
-        PresentModeKHR surfacePresentMode = ChooseSwapchainPresentMode(
+        SurfaceFormatKHR surfaceFormat = VkChooseSwapchainSurfaceFormat(
+            swapchainSupportDetails.SurfaceFormats
+        );
+        s_vkSwapchainImageFormat = surfaceFormat.Format;
+
+        PresentModeKHR surfacePresentMode = VkChooseSwapchainPresentMode(
             swapchainSupportDetails.PresentModes
         );
 
-        swapchainExtent = ChooseSwapchainExtent(swapchainSupportDetails.Capabilities);
+        s_vkSwapchainExtent = VkChooseSwapchainExtent(swapchainSupportDetails.SurfaceCapabilities);
 
-        uint swapchainImagesCount = swapchainSupportDetails.Capabilities.MinImageCount + 1;
+        uint swapchainImagesCount = swapchainSupportDetails.SurfaceCapabilities.MinImageCount + 1;
         if (
-            swapchainSupportDetails.Capabilities.MaxImageCount > 0
-            && swapchainImagesCount > swapchainSupportDetails.Capabilities.MaxImageCount
+            swapchainSupportDetails.SurfaceCapabilities.MaxImageCount > 0
+            && swapchainImagesCount > swapchainSupportDetails.SurfaceCapabilities.MaxImageCount
         )
         {
-            swapchainImagesCount = swapchainSupportDetails.Capabilities.MaxImageCount;
+            swapchainImagesCount = swapchainSupportDetails.SurfaceCapabilities.MaxImageCount;
         }
 
         SwapchainCreateInfoKHR swapchainCreateInfo = new()
         {
             SType = StructureType.SwapchainCreateInfoKhr,
-            Surface = surface,
+            Surface = s_vkSurface,
             MinImageCount = swapchainImagesCount,
             ImageFormat = surfaceFormat.Format,
             ImageColorSpace = surfaceFormat.ColorSpace,
-            ImageExtent = swapchainExtent,
+            ImageExtent = s_vkSwapchainExtent,
             ImageArrayLayers = 1,
             ImageUsage = ImageUsageFlags.ColorAttachmentBit,
-            PreTransform = swapchainSupportDetails.Capabilities.CurrentTransform,
+            PreTransform = swapchainSupportDetails.SurfaceCapabilities.CurrentTransform,
             CompositeAlpha = CompositeAlphaFlagsKHR.OpaqueBitKhr,
             PresentMode = surfacePresentMode,
             Clipped = true,
         };
 
-        QueueFamilyIndices queueFamilyIndices = FindQueueFamilies(physicalDevice);
         uint* queueFamilyIndicesPtr = stackalloc[] {
-            queueFamilyIndices.GraphicsFamilyIndex!.Value,
-            queueFamilyIndices.PresentFamilyIndex!.Value,
+            s_vkQueueFamilyIndices.GraphicsFamilyIndex!.Value,
+            s_vkQueueFamilyIndices.PresentFamilyIndex!.Value,
         };
 
-        if (queueFamilyIndices.GraphicsFamilyIndex != queueFamilyIndices.PresentFamilyIndex)
+        if (s_vkQueueFamilyIndices.GraphicsFamilyIndex != s_vkQueueFamilyIndices.PresentFamilyIndex)
         {
             swapchainCreateInfo.ImageSharingMode = SharingMode.Concurrent;
             swapchainCreateInfo.PQueueFamilyIndices = queueFamilyIndicesPtr;
@@ -584,95 +417,48 @@ unsafe
         }
 
         Trace.Assert(
-            khrSwapchain.CreateSwapchain(
-                device,
+            s_vkKhrSwapchain.CreateSwapchain(
+                s_vkDevice,
                 in swapchainCreateInfo,
                 null,
-                out SwapchainKHR swapchain
+                out s_vkSwapchain
             ) == Result.Success
         );
 
         Trace.Assert(
-            khrSwapchain.GetSwapchainImages(device, swapchain, ref swapchainImagesCount, null)
-                == Result.Success
+            s_vkKhrSwapchain.GetSwapchainImages(
+                s_vkDevice,
+                s_vkSwapchain,
+                ref swapchainImagesCount,
+                null
+            ) == Result.Success
         );
-        swapchainImages = new Image[swapchainImagesCount];
-        fixed (Image* swapchainImagesPtr = swapchainImages)
+        s_vkSwapchainImages = new Image[swapchainImagesCount];
+        fixed (Image* swapchainImagesPtr = s_vkSwapchainImages)
         {
             Trace.Assert(
-                khrSwapchain.GetSwapchainImages(
-                    device,
-                    swapchain,
+                s_vkKhrSwapchain.GetSwapchainImages(
+                    s_vkDevice,
+                    s_vkSwapchain,
                     ref swapchainImagesCount,
                     swapchainImagesPtr
                 ) == Result.Success
             );
         }
-
-        return swapchain;
     }
 
-    SurfaceFormatKHR ChooseSwapchainSurfaceFormat(IReadOnlyList<SurfaceFormatKHR> surfaceFormats)
+    private static void VkCreateSwapchainImageViews()
     {
-        return surfaceFormats.FirstOrDefault(
-            x =>
-                x.Format == Format.B8G8R8A8Srgb
-                && x.ColorSpace == ColorSpaceKHR.SpaceSrgbNonlinearKhr,
-            surfaceFormats[0]
-        );
-    }
+        s_vkSwapchainImageViews = new ImageView[s_vkSwapchainImages.Length];
 
-    PresentModeKHR ChooseSwapchainPresentMode(IReadOnlyList<PresentModeKHR> presentModes)
-    {
-        return presentModes.FirstOrDefault(
-            x => x == PresentModeKHR.MailboxKhr,
-            PresentModeKHR.FifoKhr
-        );
-    }
-
-    Extent2D ChooseSwapchainExtent(SurfaceCapabilitiesKHR surfaceCapabilities)
-    {
-        if (surfaceCapabilities.CurrentExtent.Width != uint.MaxValue)
-        {
-            return surfaceCapabilities.CurrentExtent;
-        }
-        else
-        {
-            Vector2D<int> framebufferSize = window.FramebufferSize;
-
-            Extent2D actualExtent = new()
-            {
-                Width = (uint)framebufferSize.X,
-                Height = (uint)framebufferSize.Y,
-            };
-
-            actualExtent.Width = Math.Clamp(
-                actualExtent.Width,
-                surfaceCapabilities.MinImageExtent.Width,
-                surfaceCapabilities.MaxImageExtent.Width
-            );
-            actualExtent.Height = Math.Clamp(
-                actualExtent.Height,
-                surfaceCapabilities.MinImageExtent.Height,
-                surfaceCapabilities.MaxImageExtent.Height
-            );
-
-            return actualExtent;
-        }
-    }
-
-    ImageView[] CreateSwapchainImageViews()
-    {
-        ImageView[] swapchainImageViews = new ImageView[swapchainImages.Length];
-
-        for (int i = 0; i < swapchainImages.Length; i++)
+        for (int i = 0; i < s_vkSwapchainImages.Length; i++)
         {
             ImageViewCreateInfo imageViewCreateInfo = new()
             {
                 SType = StructureType.ImageViewCreateInfo,
-                Image = swapchainImages[i],
+                Image = s_vkSwapchainImages[i],
                 ViewType = ImageViewType.Type2D,
-                Format = swapchainImageFormat,
+                Format = s_vkSwapchainImageFormat,
                 Components =
                 {
                     R = ComponentSwizzle.Identity,
@@ -691,19 +477,21 @@ unsafe
             };
 
             Trace.Assert(
-                vk.CreateImageView(device, in imageViewCreateInfo, null, out swapchainImageViews[i])
-                    == Result.Success
+                s_vkApi.CreateImageView(
+                    s_vkDevice,
+                    in imageViewCreateInfo,
+                    null,
+                    out s_vkSwapchainImageViews[i]
+                ) == Result.Success
             );
         }
-
-        return swapchainImageViews;
     }
 
-    RenderPass CreateRenderPass()
+    private static void VkCreateRenderPass()
     {
         AttachmentDescription colorAttachmentDescription = new()
         {
-            Format = swapchainImageFormat,
+            Format = s_vkSwapchainImageFormat,
             Samples = SampleCountFlags.Count1Bit,
             LoadOp = AttachmentLoadOp.Clear,
             StoreOp = AttachmentStoreOp.Store,
@@ -735,20 +523,18 @@ unsafe
         };
 
         Trace.Assert(
-            vk.CreateRenderPass(device, in renderPassCreateInfo, null, out RenderPass renderPass)
+            s_vkApi.CreateRenderPass(s_vkDevice, in renderPassCreateInfo, null, out s_vkRenderPass)
                 == Result.Success
         );
-
-        return renderPass;
     }
 
-    Pipeline CreateGraphicsPipeline(out PipelineLayout pipelineLayout)
+    private static void VkCreateGraphicsPipeline()
     {
         byte[] vertShaderCode = CompiledShaders.shaders.shader_vert.ToArray();
         byte[] fragShaderCode = CompiledShaders.shaders.shader_frag.ToArray();
 
-        ShaderModule vertShaderModule = CreateShaderModule(vertShaderCode);
-        ShaderModule fragShaderModule = CreateShaderModule(fragShaderCode);
+        ShaderModule vertShaderModule = VkCreateShaderModule(vertShaderCode);
+        ShaderModule fragShaderModule = VkCreateShaderModule(fragShaderCode);
 
         PipelineShaderStageCreateInfo vertShaderStageCreateInfo = new()
         {
@@ -786,13 +572,13 @@ unsafe
         {
             X = 0,
             Y = 0,
-            Width = swapchainExtent.Width,
-            Height = swapchainExtent.Height,
+            Width = s_vkSwapchainExtent.Width,
+            Height = s_vkSwapchainExtent.Height,
             MinDepth = 0,
             MaxDepth = 1,
         };
 
-        Rect2D scissor = new() { Offset = { X = 0, Y = 0 }, Extent = swapchainExtent };
+        Rect2D scissor = new() { Offset = { X = 0, Y = 0 }, Extent = s_vkSwapchainExtent };
 
         PipelineViewportStateCreateInfo viewportStateCreateInfo = new()
         {
@@ -847,8 +633,12 @@ unsafe
         };
 
         Trace.Assert(
-            vk.CreatePipelineLayout(device, in pipelineLayoutCreateInfo, null, out pipelineLayout)
-                == Result.Success
+            s_vkApi.CreatePipelineLayout(
+                s_vkDevice,
+                in pipelineLayoutCreateInfo,
+                null,
+                out s_vkPipelineLayout
+            ) == Result.Success
         );
 
         GraphicsPipelineCreateInfo graphicsPipelineCreateInfo = new()
@@ -862,129 +652,101 @@ unsafe
             PRasterizationState = &rasterizationStateCreateInfo,
             PMultisampleState = &multisampleStateCreateInfo,
             PColorBlendState = &colorBlendStateCreateInfo,
-            Layout = pipelineLayout,
-            RenderPass = renderPass,
+            Layout = s_vkPipelineLayout,
+            RenderPass = s_vkRenderPass,
             Subpass = 0,
         };
 
         Trace.Assert(
-            vk.CreateGraphicsPipelines(
-                device,
+            s_vkApi.CreateGraphicsPipelines(
+                s_vkDevice,
                 default,
                 1,
                 in graphicsPipelineCreateInfo,
                 null,
-                out Pipeline graphicsPipeline
+                out s_vkGraphicsPipeline
             ) == Result.Success
         );
 
-        vk.DestroyShaderModule(device, fragShaderModule, null);
-        vk.DestroyShaderModule(device, vertShaderModule, null);
+        s_vkApi.DestroyShaderModule(s_vkDevice, fragShaderModule, null);
+        s_vkApi.DestroyShaderModule(s_vkDevice, vertShaderModule, null);
 
         Trace.Assert(SilkMarshal.Free((nint)vertShaderStageCreateInfo.PName));
         Trace.Assert(SilkMarshal.Free((nint)fragShaderStageCreateInfo.PName));
-
-        return graphicsPipeline;
     }
 
-    ShaderModule CreateShaderModule(byte[] code)
+    private static void VkCreateSwapchainFramebuffers()
     {
-        ShaderModuleCreateInfo shaderModuleCreateInfo = new()
+        s_vkSwapchainFramebuffers = new Framebuffer[s_vkSwapchainImageViews.Length];
+
+        for (int i = 0; i < s_vkSwapchainImageViews.Length; i++)
         {
-            SType = StructureType.ShaderModuleCreateInfo,
-            CodeSize = (nuint)code.Length,
-        };
-
-        ShaderModule shaderModule;
-
-        fixed (byte* codePtr = code)
-        {
-            shaderModuleCreateInfo.PCode = (uint*)codePtr;
-
-            Trace.Assert(
-                vk.CreateShaderModule(device, in shaderModuleCreateInfo, null, out shaderModule)
-                    == Result.Success
-            );
-        }
-
-        return shaderModule;
-    }
-
-    Framebuffer[] CreateSwapchainFramebuffers()
-    {
-        swapchainFramebuffers = new Framebuffer[swapchainImageViews.Length];
-
-        for (int i = 0; i < swapchainImageViews.Length; i++)
-        {
-            ImageView attachment = swapchainImageViews[i];
+            ImageView attachment = s_vkSwapchainImageViews[i];
 
             FramebufferCreateInfo framebufferCreateInfo = new()
             {
                 SType = StructureType.FramebufferCreateInfo,
-                RenderPass = renderPass,
+                RenderPass = s_vkRenderPass,
                 AttachmentCount = 1,
                 PAttachments = &attachment,
-                Width = swapchainExtent.Width,
-                Height = swapchainExtent.Height,
+                Width = s_vkSwapchainExtent.Width,
+                Height = s_vkSwapchainExtent.Height,
                 Layers = 1,
             };
 
             Trace.Assert(
-                vk.CreateFramebuffer(
-                    device,
+                s_vkApi.CreateFramebuffer(
+                    s_vkDevice,
                     in framebufferCreateInfo,
                     null,
-                    out swapchainFramebuffers[i]
+                    out s_vkSwapchainFramebuffers[i]
                 ) == Result.Success
             );
         }
-
-        return swapchainFramebuffers;
     }
 
-    CommandPool CreateCommandPool()
+    private static void VkCreateCommandPool()
     {
-        QueueFamilyIndices queueFamilyIndices = FindQueueFamilies(physicalDevice);
-
         CommandPoolCreateInfo commandPoolCreateInfo = new()
         {
             SType = StructureType.CommandPoolCreateInfo,
-            QueueFamilyIndex = queueFamilyIndices.GraphicsFamilyIndex!.Value,
+            QueueFamilyIndex = s_vkQueueFamilyIndices.GraphicsFamilyIndex!.Value,
         };
 
         Trace.Assert(
-            vk.CreateCommandPool(
-                device,
+            s_vkApi.CreateCommandPool(
+                s_vkDevice,
                 in commandPoolCreateInfo,
                 null,
-                out CommandPool commandPool
+                out s_vkCommandPool
             ) == Result.Success
         );
-
-        return commandPool;
     }
 
-    CommandBuffer[] CreateCommandBuffers()
+    private static void VkCreateCommandBuffers()
     {
-        CommandBuffer[] commandBuffers = new CommandBuffer[swapchainFramebuffers.Length];
+        s_vkCommandBuffers = new CommandBuffer[s_vkSwapchainFramebuffers.Length];
 
         CommandBufferAllocateInfo commandBufferAllocateInfo = new()
         {
             SType = StructureType.CommandBufferAllocateInfo,
-            CommandPool = commandPool,
+            CommandPool = s_vkCommandPool,
             Level = CommandBufferLevel.Primary,
-            CommandBufferCount = (uint)commandBuffers.Length,
+            CommandBufferCount = (uint)s_vkCommandBuffers.Length,
         };
 
-        fixed (CommandBuffer* commandBuffersPtr = commandBuffers)
+        fixed (CommandBuffer* commandBuffersPtr = s_vkCommandBuffers)
         {
             Trace.Assert(
-                vk.AllocateCommandBuffers(device, in commandBufferAllocateInfo, commandBuffersPtr)
-                    == Result.Success
+                s_vkApi.AllocateCommandBuffers(
+                    s_vkDevice,
+                    in commandBufferAllocateInfo,
+                    commandBuffersPtr
+                ) == Result.Success
             );
         }
 
-        for (int i = 0; i < commandBuffers.Length; i++)
+        for (int i = 0; i < s_vkCommandBuffers.Length; i++)
         {
             CommandBufferBeginInfo commandBufferBeginInfo = new()
             {
@@ -992,7 +754,7 @@ unsafe
             };
 
             Trace.Assert(
-                vk.BeginCommandBuffer(commandBuffers[i], in commandBufferBeginInfo)
+                s_vkApi.BeginCommandBuffer(s_vkCommandBuffers[i], in commandBufferBeginInfo)
                     == Result.Success
             );
 
@@ -1010,38 +772,39 @@ unsafe
             RenderPassBeginInfo renderPassBeginInfo = new()
             {
                 SType = StructureType.RenderPassBeginInfo,
-                RenderPass = renderPass,
-                Framebuffer = swapchainFramebuffers[i],
-                RenderArea = { Offset = { X = 0, Y = 0 }, Extent = swapchainExtent },
+                RenderPass = s_vkRenderPass,
+                Framebuffer = s_vkSwapchainFramebuffers[i],
+                RenderArea = { Offset = { X = 0, Y = 0 }, Extent = s_vkSwapchainExtent },
                 ClearValueCount = 1,
                 PClearValues = &clearValue,
             };
 
-            vk.CmdBeginRenderPass(commandBuffers[i], &renderPassBeginInfo, SubpassContents.Inline);
+            s_vkApi.CmdBeginRenderPass(
+                s_vkCommandBuffers[i],
+                &renderPassBeginInfo,
+                SubpassContents.Inline
+            );
 
-            vk.CmdBindPipeline(commandBuffers[i], PipelineBindPoint.Graphics, graphicsPipeline);
-            vk.CmdDraw(commandBuffers[i], 3, 1, 0, 0);
+            s_vkApi.CmdBindPipeline(
+                s_vkCommandBuffers[i],
+                PipelineBindPoint.Graphics,
+                s_vkGraphicsPipeline
+            );
+            s_vkApi.CmdDraw(s_vkCommandBuffers[i], 3, 1, 0, 0);
 
-            vk.CmdEndRenderPass(commandBuffers[i]);
+            s_vkApi.CmdEndRenderPass(s_vkCommandBuffers[i]);
 
-            Trace.Assert(vk.EndCommandBuffer(commandBuffers[i]) == Result.Success);
+            Trace.Assert(s_vkApi.EndCommandBuffer(s_vkCommandBuffers[i]) == Result.Success);
         }
-
-        return commandBuffers;
     }
 
-    void CreateSynchronizationObjects(
-        out Semaphore[] imageAvailableSemaphores,
-        out Semaphore[] renderFinishedSemaphores,
-        out Fence[] inFlightFences,
-        out Fence[] imagesInFlight
-    )
+    private static void VkCreateSynchronizationObjects()
     {
-        imageAvailableSemaphores = new Semaphore[maxFramesInFlight];
-        renderFinishedSemaphores = new Semaphore[maxFramesInFlight];
+        s_vkImageAvailableSemaphores = new Semaphore[VK_MAX_FRAMES_IN_FLIGHT];
+        s_vkRenderFinishedSemaphores = new Semaphore[VK_MAX_FRAMES_IN_FLIGHT];
 
-        inFlightFences = new Fence[maxFramesInFlight];
-        imagesInFlight = new Fence[swapchainImages.Length];
+        s_vkInFlightFences = new Fence[VK_MAX_FRAMES_IN_FLIGHT];
+        s_vkImagesInFlight = new Fence[s_vkSwapchainImages.Length];
 
         SemaphoreCreateInfo semaphoreCreateInfo = new()
         {
@@ -1054,68 +817,80 @@ unsafe
             Flags = FenceCreateFlags.SignaledBit,
         };
 
-        for (int i = 0; i < maxFramesInFlight; i++)
+        for (int i = 0; i < VK_MAX_FRAMES_IN_FLIGHT; i++)
         {
             Trace.Assert(
-                vk.CreateSemaphore(
-                    device,
+                s_vkApi.CreateSemaphore(
+                    s_vkDevice,
                     in semaphoreCreateInfo,
                     null,
-                    out imageAvailableSemaphores[i]
+                    out s_vkImageAvailableSemaphores[i]
                 ) == Result.Success
             );
 
             Trace.Assert(
-                vk.CreateSemaphore(
-                    device,
+                s_vkApi.CreateSemaphore(
+                    s_vkDevice,
                     in semaphoreCreateInfo,
                     null,
-                    out renderFinishedSemaphores[i]
+                    out s_vkRenderFinishedSemaphores[i]
                 ) == Result.Success
             );
 
             Trace.Assert(
-                vk.CreateFence(device, in fenceCreateInfo, null, out inFlightFences[i])
+                s_vkApi.CreateFence(s_vkDevice, in fenceCreateInfo, null, out s_vkInFlightFences[i])
                     == Result.Success
             );
         }
     }
 
-    void DrawFrame(double delta)
+    private static void DrawFrame(double delta)
     {
         Trace.Assert(
-            vk.WaitForFences(device, 1, in inFlightFences[currentFrame], true, ulong.MaxValue)
-                == Result.Success
+            s_vkApi.WaitForFences(
+                s_vkDevice,
+                1,
+                in s_vkInFlightFences[s_vkCurrentFrame],
+                true,
+                ulong.MaxValue
+            ) == Result.Success
         );
 
         uint imageIndex = 0;
         Trace.Assert(
-            khrSwapchain.AcquireNextImage(
-                device,
-                swapchain,
+            s_vkKhrSwapchain.AcquireNextImage(
+                s_vkDevice,
+                s_vkSwapchain,
                 ulong.MaxValue,
-                imageAvailableSemaphores[currentFrame],
+                s_vkImageAvailableSemaphores[s_vkCurrentFrame],
                 default,
                 ref imageIndex
             ) == Result.Success
         );
 
-        if (imagesInFlight[imageIndex].Handle != 0)
+        if (s_vkImagesInFlight[imageIndex].Handle != 0)
         {
             Trace.Assert(
-                vk.WaitForFences(device, 1, in imagesInFlight[imageIndex], true, ulong.MaxValue)
-                    == Result.Success
+                s_vkApi.WaitForFences(
+                    s_vkDevice,
+                    1,
+                    in s_vkImagesInFlight[imageIndex],
+                    true,
+                    ulong.MaxValue
+                ) == Result.Success
             );
         }
 
-        imagesInFlight[imageIndex] = inFlightFences[currentFrame];
+        s_vkImagesInFlight[imageIndex] = s_vkInFlightFences[s_vkCurrentFrame];
 
-        Semaphore* waitSemaphores = stackalloc[] { imageAvailableSemaphores[currentFrame] };
+        Semaphore* waitSemaphores = stackalloc[] { s_vkImageAvailableSemaphores[s_vkCurrentFrame] };
         PipelineStageFlags* waitStages = stackalloc[] {
             PipelineStageFlags.ColorAttachmentOutputBit,
         };
-        CommandBuffer commandBuffer = commandBuffers[imageIndex];
-        Semaphore* signalSemaphores = stackalloc[] { renderFinishedSemaphores[currentFrame] };
+        CommandBuffer commandBuffer = s_vkCommandBuffers[imageIndex];
+        Semaphore* signalSemaphores = stackalloc[] {
+            s_vkRenderFinishedSemaphores[s_vkCurrentFrame],
+        };
         SubmitInfo submitInfo = new()
         {
             SType = StructureType.SubmitInfo,
@@ -1128,13 +903,20 @@ unsafe
             PSignalSemaphores = signalSemaphores,
         };
 
-        Trace.Assert(vk.ResetFences(device, 1, in inFlightFences[currentFrame]) == Result.Success);
         Trace.Assert(
-            vk.QueueSubmit(graphicsQueue, 1, in submitInfo, inFlightFences[currentFrame])
+            s_vkApi.ResetFences(s_vkDevice, 1, in s_vkInFlightFences[s_vkCurrentFrame])
                 == Result.Success
         );
+        Trace.Assert(
+            s_vkApi.QueueSubmit(
+                s_vkGraphicsQueue,
+                1,
+                in submitInfo,
+                s_vkInFlightFences[s_vkCurrentFrame]
+            ) == Result.Success
+        );
 
-        SwapchainKHR* swapchains = stackalloc[] { swapchain };
+        SwapchainKHR* swapchains = stackalloc[] { s_vkSwapchain };
         PresentInfoKHR presentInfo = new()
         {
             SType = StructureType.PresentInfoKhr,
@@ -1145,25 +927,318 @@ unsafe
             PImageIndices = &imageIndex,
         };
 
-        Trace.Assert(khrSwapchain.QueuePresent(presentQueue, in presentInfo) == Result.Success);
+        Trace.Assert(
+            s_vkKhrSwapchain.QueuePresent(s_vkPresentQueue, in presentInfo) == Result.Success
+        );
 
-        currentFrame = (currentFrame + 1) % maxFramesInFlight;
+        s_vkCurrentFrame = (s_vkCurrentFrame + 1) % VK_MAX_FRAMES_IN_FLIGHT;
     }
-}
 
-internal struct QueueFamilyIndices
-{
-    public uint? GraphicsFamilyIndex { get; set; }
-    public uint? PresentFamilyIndex { get; set; }
+    private static bool VkCheckValidationLayersSupport()
+    {
+        uint availableLayersCount = 0;
+        Trace.Assert(
+            s_vkApi.EnumerateInstanceLayerProperties(ref availableLayersCount, null)
+                == Result.Success
+        );
 
-    public readonly bool IsComplete => GraphicsFamilyIndex.HasValue && PresentFamilyIndex.HasValue;
-}
+        LayerProperties[] availableLayers = new LayerProperties[availableLayersCount];
+        fixed (LayerProperties* availableLayersPtr = availableLayers)
+        {
+            Trace.Assert(
+                s_vkApi.EnumerateInstanceLayerProperties(
+                    ref availableLayersCount,
+                    availableLayersPtr
+                ) == Result.Success
+            );
+        }
 
-internal struct SwapchainSupportDetails
-{
-    public SurfaceCapabilitiesKHR Capabilities { get; set; }
-    public SurfaceFormatKHR[] Formats { get; set; } = [];
-    public PresentModeKHR[] PresentModes { get; set; } = [];
+        return s_vkRequiredValidationLayers.All(
+            availableLayers.Select(x => Marshal.PtrToStringAnsi((nint)x.LayerName)).Contains
+        );
+    }
 
-    public SwapchainSupportDetails() { }
+    private static string[] VkGetInstanceRequiredExtensions()
+    {
+        byte** glfwExtensionsPtr = s_window.VkSurface!.GetRequiredExtensions(
+            out uint glfwExtensionsCount
+        );
+
+        string[] glfwExtensions = SilkMarshal.PtrToStringArray(
+            (nint)glfwExtensionsPtr,
+            (int)glfwExtensionsCount
+        );
+
+        return s_vkEnableValidationLayers
+            ? [.. glfwExtensions, ExtDebugUtils.ExtensionName]
+            : glfwExtensions;
+    }
+
+    private static uint VkDebugCallback(
+        DebugUtilsMessageSeverityFlagsEXT messageSeverity,
+        DebugUtilsMessageTypeFlagsEXT messageTypes,
+        DebugUtilsMessengerCallbackDataEXT* pCallbackData,
+        void* pUserData
+    )
+    {
+        Console.WriteLine(
+            $"VULKAN VALIDATION LAYER: {Marshal.PtrToStringAnsi((nint)pCallbackData->PMessage)}"
+        );
+
+        return Vk.False;
+    }
+
+    private static bool VkIsPhysicalDeviceSuitable(PhysicalDevice physicalDevice)
+    {
+        s_vkQueueFamilyIndices = VkFindQueueFamilies(physicalDevice);
+
+        if (!s_vkQueueFamilyIndices.IsComplete)
+        {
+            return false;
+        }
+
+        if (!VkCheckPhysicalDeviceExtensionsSupport(physicalDevice))
+        {
+            return false;
+        }
+
+        VkSwapchainSupportDetails swapchainSupportDetails = VkQuerySwapchainSupport(physicalDevice);
+
+        bool isSwapchainAdequate =
+            swapchainSupportDetails.SurfaceFormats.Length != 0
+            && swapchainSupportDetails.PresentModes.Length != 0;
+
+        return isSwapchainAdequate;
+    }
+
+    private static VkQueueFamilyIndices VkFindQueueFamilies(PhysicalDevice physicalDevice)
+    {
+        uint queueFamiliesCount = 0;
+        s_vkApi.GetPhysicalDeviceQueueFamilyProperties(
+            physicalDevice,
+            ref queueFamiliesCount,
+            null
+        );
+
+        QueueFamilyProperties[] queueFamilies = new QueueFamilyProperties[queueFamiliesCount];
+        fixed (QueueFamilyProperties* queueFamiliesPtr = queueFamilies)
+        {
+            s_vkApi.GetPhysicalDeviceQueueFamilyProperties(
+                physicalDevice,
+                ref queueFamiliesCount,
+                queueFamiliesPtr
+            );
+        }
+
+        VkQueueFamilyIndices queueFamilyIndices = new();
+
+        for (uint i = 0; i < queueFamilies.Length; i++)
+        {
+            if (queueFamilies[i].QueueFlags.HasFlag(QueueFlags.GraphicsBit))
+            {
+                queueFamilyIndices.GraphicsFamilyIndex ??= i;
+            }
+
+            Trace.Assert(
+                s_vkKhrSurface.GetPhysicalDeviceSurfaceSupport(
+                    physicalDevice,
+                    i,
+                    s_vkSurface,
+                    out Bool32 presentSupport
+                ) == Result.Success
+            );
+
+            if (presentSupport)
+            {
+                queueFamilyIndices.PresentFamilyIndex ??= i;
+            }
+
+            if (queueFamilyIndices.IsComplete)
+            {
+                break;
+            }
+        }
+
+        return queueFamilyIndices;
+    }
+
+    private static bool VkCheckPhysicalDeviceExtensionsSupport(PhysicalDevice physicalDevice)
+    {
+        uint availableExtensionsCount = 0;
+        Trace.Assert(
+            s_vkApi.EnumerateDeviceExtensionProperties(
+                physicalDevice,
+                (byte*)null,
+                ref availableExtensionsCount,
+                null
+            ) == Result.Success
+        );
+
+        ExtensionProperties[] availableExtensions = new ExtensionProperties[
+            availableExtensionsCount
+        ];
+        fixed (ExtensionProperties* availableExtensionsPtr = availableExtensions)
+        {
+            Trace.Assert(
+                s_vkApi.EnumerateDeviceExtensionProperties(
+                    physicalDevice,
+                    (byte*)null,
+                    ref availableExtensionsCount,
+                    availableExtensionsPtr
+                ) == Result.Success
+            );
+        }
+
+        return s_vkRequiredPhysicalDeviceExtensions.All(
+            availableExtensions.Select(x => Marshal.PtrToStringAnsi((nint)x.ExtensionName)).Contains
+        );
+    }
+
+    private static VkSwapchainSupportDetails VkQuerySwapchainSupport(PhysicalDevice physicalDevice)
+    {
+        VkSwapchainSupportDetails swapchainSupportDetails = new();
+
+        Trace.Assert(
+            s_vkKhrSurface.GetPhysicalDeviceSurfaceCapabilities(
+                physicalDevice,
+                s_vkSurface,
+                out SurfaceCapabilitiesKHR capabilities
+            ) == Result.Success
+        );
+        swapchainSupportDetails.SurfaceCapabilities = capabilities;
+
+        uint surfaceFormatsCount = 0;
+        Trace.Assert(
+            s_vkKhrSurface.GetPhysicalDeviceSurfaceFormats(
+                physicalDevice,
+                s_vkSurface,
+                ref surfaceFormatsCount,
+                null
+            ) == Result.Success
+        );
+
+        if (surfaceFormatsCount != 0)
+        {
+            swapchainSupportDetails.SurfaceFormats = new SurfaceFormatKHR[surfaceFormatsCount];
+            fixed (SurfaceFormatKHR* surfaceFormatsPtr = swapchainSupportDetails.SurfaceFormats)
+            {
+                Trace.Assert(
+                    s_vkKhrSurface.GetPhysicalDeviceSurfaceFormats(
+                        physicalDevice,
+                        s_vkSurface,
+                        ref surfaceFormatsCount,
+                        surfaceFormatsPtr
+                    ) == Result.Success
+                );
+            }
+        }
+
+        uint surfacePresentModesCount = 0;
+        Trace.Assert(
+            s_vkKhrSurface.GetPhysicalDeviceSurfacePresentModes(
+                physicalDevice,
+                s_vkSurface,
+                ref surfacePresentModesCount,
+                null
+            ) == Result.Success
+        );
+
+        if (surfacePresentModesCount != 0)
+        {
+            swapchainSupportDetails.PresentModes = new PresentModeKHR[surfacePresentModesCount];
+            fixed (PresentModeKHR* surfacePresentModesPtr = swapchainSupportDetails.PresentModes)
+            {
+                Trace.Assert(
+                    s_vkKhrSurface.GetPhysicalDeviceSurfacePresentModes(
+                        physicalDevice,
+                        s_vkSurface,
+                        ref surfacePresentModesCount,
+                        surfacePresentModesPtr
+                    ) == Result.Success
+                );
+            }
+        }
+
+        return swapchainSupportDetails;
+    }
+
+    private static SurfaceFormatKHR VkChooseSwapchainSurfaceFormat(
+        SurfaceFormatKHR[] surfaceFormats
+    )
+    {
+        return surfaceFormats.FirstOrDefault(
+            x =>
+                x.Format == Format.B8G8R8A8Srgb
+                && x.ColorSpace == ColorSpaceKHR.SpaceSrgbNonlinearKhr,
+            surfaceFormats[0]
+        );
+    }
+
+    private static PresentModeKHR VkChooseSwapchainPresentMode(
+        IReadOnlyList<PresentModeKHR> presentModes
+    )
+    {
+        return presentModes.FirstOrDefault(
+            x => x == PresentModeKHR.MailboxKhr,
+            PresentModeKHR.FifoKhr
+        );
+    }
+
+    private static Extent2D VkChooseSwapchainExtent(SurfaceCapabilitiesKHR surfaceCapabilities)
+    {
+        if (surfaceCapabilities.CurrentExtent.Width != uint.MaxValue)
+        {
+            return surfaceCapabilities.CurrentExtent;
+        }
+        else
+        {
+            Vector2D<int> framebufferSize = s_window.FramebufferSize;
+
+            Extent2D actualExtent = new()
+            {
+                Width = (uint)framebufferSize.X,
+                Height = (uint)framebufferSize.Y,
+            };
+
+            actualExtent.Width = Math.Clamp(
+                actualExtent.Width,
+                surfaceCapabilities.MinImageExtent.Width,
+                surfaceCapabilities.MaxImageExtent.Width
+            );
+            actualExtent.Height = Math.Clamp(
+                actualExtent.Height,
+                surfaceCapabilities.MinImageExtent.Height,
+                surfaceCapabilities.MaxImageExtent.Height
+            );
+
+            return actualExtent;
+        }
+    }
+
+    private static ShaderModule VkCreateShaderModule(byte[] code)
+    {
+        ShaderModuleCreateInfo shaderModuleCreateInfo = new()
+        {
+            SType = StructureType.ShaderModuleCreateInfo,
+            CodeSize = (nuint)code.Length,
+        };
+
+        ShaderModule shaderModule;
+
+        fixed (byte* codePtr = code)
+        {
+            shaderModuleCreateInfo.PCode = (uint*)codePtr;
+
+            Trace.Assert(
+                s_vkApi.CreateShaderModule(
+                    s_vkDevice,
+                    in shaderModuleCreateInfo,
+                    null,
+                    out shaderModule
+                ) == Result.Success
+            );
+        }
+
+        return shaderModule;
+    }
 }

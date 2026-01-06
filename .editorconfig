@@ -329,3 +329,6 @@ dotnet_diagnostic.UNT0010.severity = warning
 dotnet_diagnostic.UNT0011.severity = warning
 dotnet_diagnostic.UNT0014.severity = warning
 dotnet_diagnostic.UNT0016.severity = warning
+
+# IDE2006: Blank line not allowed after arrow expression clause token
+dotnet_diagnostic.IDE2006.severity = none
