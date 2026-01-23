@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
@@ -297,11 +296,10 @@ internal static unsafe class Program
         ];
         uniqueQueueFamilies = [.. uniqueQueueFamilies.Distinct()];
 
-        using GlobalMemory deviceQueueCreateInfosAlloc = GlobalMemory.Allocate(
-            uniqueQueueFamilies.Length * sizeof(DeviceQueueCreateInfo)
-        );
-        DeviceQueueCreateInfo* deviceQueueCreateInfos = (DeviceQueueCreateInfo*)
-            Unsafe.AsPointer(ref deviceQueueCreateInfosAlloc.GetPinnableReference());
+        DeviceQueueCreateInfo* deviceQueueCreateInfos =
+            stackalloc DeviceQueueCreateInfo[
+                uniqueQueueFamilies.Length * sizeof(DeviceQueueCreateInfo)
+            ];
 
         float queuePriority = 1.0f;
         for (int i = 0; i < uniqueQueueFamilies.Length; i++)
